@@ -1,0 +1,12 @@
+gast
+ml-dtypes
+wrapt
+google-api-python-client
+google
+absl-py
+astunparse
+termcolor
+opt_einsum
+flatbuffers
+h5py
+keras
