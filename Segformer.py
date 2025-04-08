@@ -8,7 +8,6 @@ from sklearn.metrics import jaccard_score
 import transformers
 from torch.utils.tensorboard import SummaryWriter
 import matplotlib.pyplot as plt
-from torchvision.utils import make_grid
 import torchvision.transforms as T
 from torch.nn import BCEWithLogitsLoss
 
@@ -18,6 +17,7 @@ MASK_DIR = 'C:/Users/Public/segformer/dataset/train/masks'
 TEST_IMAGE_DIR = 'C:/Users/Public/segformer/dataset/test/images'
 TEST_MASK_DIR = 'C:/Users/Public/segformer/dataset/test/masks'
 NUM_CLASSES = 2
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 #Dataset 
@@ -41,7 +41,7 @@ class SegmentationDataset(Dataset):
         pixel_values = encoding['pixel_values'].squeeze(0)
         
         mask = np.array(mask)
-
+        mask = (mask > 127).astype(np.uint8)
         mask= np.clip(mask, 0 , NUM_CLASSES -1)
         mask = torch.tensor(mask, dtype=torch.long)
 
@@ -55,9 +55,9 @@ def compute_iou(preds, labels, num_classes):
     labels = torch.tensor(labels) if not isinstance(labels, torch.Tensor) else labels
     
     # Flatten preds and labels tensors
-    preds = preds.view(-1)
-    labels = labels.view(-1)
-
+    preds = preds.flatten()
+    labels = labels.flatten()
+    
     # Print the shapes of preds and labels
     print(f"preds shape: {preds.shape}, labels shape: {labels.shape}")
 
@@ -93,8 +93,9 @@ def dice_loss(pred, target, smooth=1e-6):
 
 def compute_pixel_accuracy(preds, labels):
     # Flatten the tensors to treat all pixels as a 1D vector
-    preds = preds.view(-1)
-    labels = labels.view(-1)
+    preds = preds.flatten()
+    labels = labels.flatten()
+
 
     # Count correctly predicted pixels
     correct_pixels = (preds == labels).sum().item()
@@ -112,14 +113,16 @@ def compute_metrics(p):
     preds = torch.argmax(preds, dim=1) 
     
     # Calculate IoU
-    dice = compute_dice_coefficient(preds, labels, num_classes=2)
+    dice = compute_dice_coefficient(preds, labels, num_classes=NUM_CLASSES)
     iou = compute_iou(preds, labels, num_classes=NUM_CLASSES)
     accuracy = compute_pixel_accuracy(preds, labels)
+    bce = loss_fn   
     
     return {
         "accuracy": accuracy,
         "dice": dice,
         "iou": iou,
+        "bce": bce,
     }
 
 class VisualizationCallback(transformers.TrainerCallback):
@@ -127,19 +130,16 @@ class VisualizationCallback(transformers.TrainerCallback):
         self.model = model
         self.num_images = num_images
         self.writer = SummaryWriter(log_dir="./logs")
-        self.test_dataloader = test_dataloader
-
+        self.test_batch = next(iter(test_dataloader)) if test_dataloader else None
+        
     def on_log(self, args, state, control, logs=None, **kwargs):
         # Check if the logs have been updated
-        if 'eval_loss' in logs:
+        if 'eval_loss' in logs and self.test_batch:
             # Get the model predictions on a batch of validation data
             self.model.eval()
             with torch.no_grad():
                 # Get a batch from the eval dataset using the provided dataloader
-                inputs = next(iter(self.test_dataloader))
-                
-                # Move inputs to the model's device
-                inputs = {key: value.to(model.device) for key, value in inputs.items()}
+                inputs = {key: value.to(self.model_batch) for key, value in self.test_batch.items()}
 
                 # Perform the forward pass
                 outputs = self.model(**inputs)
@@ -160,20 +160,20 @@ class VisualizationCallback(transformers.TrainerCallback):
 
                     # Overlay predicted mask with original image using transparency
                     pred_mask_colored = class_colors[pred_mask]
-                    overlay_image = np.where(pred_mask_colored == [0, 0, 0], input_image, pred_mask_colored)
+                    overlay_image = (1 - 0.6) * input_image + 0.6 *(pred_mask_colored / 255.0)
 
                     # Log the input image and the overlayed prediction to TensorBoard
                     input_image_tensor = T.ToTensor()(input_image)
+                    
                     self.writer.add_image(f"Input Image {i}", input_image_tensor, global_step=state.global_step)
 
                     overlay_image_tensor = T.ToTensor()(overlay_image)
                     self.writer.add_image(f"Overlayed Predicted Mask {i}", overlay_image_tensor, global_step=state.global_step)
 
-
-                if state.global_step % 100 == 0: 
-                    plt.imshow(pred_mask)
-                    plt.title(f"Epoch {state.epoch} - Predicted Mask")
-                    plt.show()
+                    gt_mask = inputs['labels'][i].cpu().numpy()
+                    gt_colored = class_colors[gt_mask]
+                    gt_tensor = T.ToTensor()(gt_colored/255.0)
+                    self.writer.add_image("Ground Truth Mask {i}", gt_tensor, global_step=state.global_step)
 
 
 
@@ -189,12 +189,13 @@ model = SegformerForSemanticSegmentation.from_pretrained(
     num_labels=NUM_CLASSES,
     ignore_mismatched_sizes=True
 )
+model.to(DEVICE)
 
 #Training parameters
 training_args = TrainingArguments(
     output_dir="./segformer-checkpoints",
     per_device_train_batch_size=4,
-    num_train_epochs=1, 
+    num_train_epochs=10, 
     logging_dir="./logs",
     save_total_limit=2,
     save_steps=200,
@@ -221,3 +222,19 @@ trainer.add_callback(visualization_callback)
 trainer.train()
 
 trainer.evaluate()
+
+def test_simgle_image(model, processor, image_path):
+    image = Image.open(image_path).convert("RGB")
+    encoding = processor(images=image, return_tensor="pt").to(DEVICE)
+    
+    model.eval()
+    with torch.no_grad():
+        outputs = model(**encoding)
+        logits = outputs.logits
+        pred = torch.argmax(logits, dim=1).squeeze().cpu().numpy()
+
+    plt.imshow(pred, cmap='gray')
+    plt.title("Predicted Mask")
+    plt.show()
+    
+# test_single_image(model, feature_extractor, "C:/Users/Public/segformer/dataset/test/images/image1.jpg")
