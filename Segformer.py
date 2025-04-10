@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 import torchvision.transforms as T
 from torch.nn import BCEWithLogitsLoss
 import torch.nn.functional as F
+from skimage.measure import find_contours
 
 #Configurations
 IMAGE_DIR = 'C:/Users/Public/segformer/dataset/train/images'
@@ -195,59 +196,64 @@ def compute_metrics(p):
 #                    gt_tensor = T.ToTensor()(gt_colored/255.0)
 #                    self.writer.add_image(f"Ground Truth Mask {i}", gt_tensor, global_step=state.global_step)
 
-def visualize_predictions(model, dataloader, device, num_images=3):
+def visualize_predictions(model, dataloader, device, num_images=3, alpha=0.6, contour_color='red'):
+    """
+    Visualizes predictions by blending the original image with the predicted mask.
+    Then, draws segmentation boundaries on the overlay.
+    
+    Parameters:
+      model: the segmentation model
+      dataloader: a DataLoader with test images
+      device: torch.device on which model/data is located
+      num_images: number of examples to display
+      alpha: blending factor for overlay (0 -> original, 1 -> mask)
+      contour_color: color used for drawing segmentation boundaries
+    """
     model.eval()
     batch = next(iter(dataloader))
-    # Move batch data to device
     inputs = {key: value.to(device) for key, value in batch.items()}
-
+    
     with torch.no_grad():
         outputs = model(**inputs)
     logits = outputs.logits  # Shape: (B, num_classes, H_pred, W_pred)
     preds = torch.argmax(logits, dim=1)  # Shape: (B, H_pred, W_pred)
-
-    # Define class colors for segmentation (e.g., background: black, foreground: white)
+    
+    # Define your class colors (here, background black; foreground white)
     class_colors = np.array([[0, 0, 0], [255, 255, 255]])
-
+    
     for i in range(min(num_images, preds.shape[0])):
-        # Convert input image to numpy (HWC) and clip values for visualization
+        # Get original image: convert to HWC and clip for display
         image = inputs['pixel_values'][i].cpu().numpy().transpose(1, 2, 0)
         image = np.clip(image, 0, 1)
-
-        # Get predicted mask and colorize it using class_colors
+        
+        # Predicted mask (initially smaller): convert to numpy
         pred_mask = preds[i].cpu().numpy()  # Shape: (H_pred, W_pred)
-        colored_pred_mask = class_colors[pred_mask]  # Shape: (H_pred, W_pred, 3)
-
-        # Upsample the colored predicted mask to match the image dimensions
-        # Convert colored_pred_mask to a tensor and add a batch dimension
-        colored_pred_mask_tensor = torch.tensor(colored_pred_mask.transpose(2, 0, 1)).unsqueeze(0).float()  # Shape: (1, 3, H_pred, W_pred)
-        # Use 'nearest' interpolation to preserve class boundaries
-        upsampled_mask_tensor = F.interpolate(colored_pred_mask_tensor,
+        # Colorize the mask according to class_colors
+        colored_mask = class_colors[pred_mask]  # Shape: (H_pred, W_pred, 3)
+        
+        # Upsample the colored mask to match the original image size
+        colored_mask_tensor = torch.tensor(colored_mask.transpose(2, 0, 1)).unsqueeze(0).float()
+        upsampled_mask_tensor = F.interpolate(colored_mask_tensor,
                                               size=(image.shape[0], image.shape[1]),
                                               mode='nearest')
-        # Remove the batch dimension and convert back to (H, W, 3) numpy array
         upsampled_mask = upsampled_mask_tensor.squeeze(0).permute(1, 2, 0).numpy()
-
-        # Create the overlay by blending the image and the upsampled predicted mask
-        overlay = (0.4 * image + 0.6 * (upsampled_mask / 255.0))
-
-        # Plot original image, predicted mask and overlay
-        plt.figure(figsize=(12, 4))
-        plt.subplot(1, 3, 1)
-        plt.imshow(image)
-        plt.title("Original Image")
-        plt.axis("off")
-
-        plt.subplot(1, 3, 2)
-        plt.imshow(pred_mask, cmap="gray")
-        plt.title("Predicted Mask")
-        plt.axis("off")
-
-        plt.subplot(1, 3, 3)
+        
+        # Blend original image and colored mask
+        overlay = (1 - alpha) * image + alpha * (upsampled_mask / 255.0)
+        
+        # Plot the overlay
+        plt.figure(figsize=(8, 8))
         plt.imshow(overlay)
-        plt.title("Overlay")
-        plt.axis("off")
-
+        
+        # Draw boundaries: find contours on the predicted mask
+        # Note: Since pred_mask is smaller, we use scaling factors
+        contours = find_contours(pred_mask, level=0.5)
+        scale_x = image.shape[1] / pred_mask.shape[1]
+        scale_y = image.shape[0] / pred_mask.shape[0]
+        for contour in contours:
+            plt.plot(contour[:, 1] * scale_x, contour[:, 0] * scale_y, linewidth=2, color=contour_color)
+        
+        plt.axis('off')
         plt.show()
 
 #Loading
