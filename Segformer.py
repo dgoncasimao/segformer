@@ -56,6 +56,65 @@ class SegmentationDataset(Dataset):
         encoding['pixel_values'] = pixel_values
         return encoding
     
+def tversky_loss(logits, labels, alpha=0.7, beta=0.3, smooth=1e-6):
+    """
+    Computes the Tversky loss between the predicted logits and the ground truth labels.
+
+    Args:
+      logits (torch.Tensor): Raw model output of shape [B, num_classes, H, W].
+      labels (torch.Tensor): Ground truth labels of shape [B, H, W] with integer class indices.
+      alpha (float): Weight for false positives.
+      beta (float): Weight for false negatives.
+      smooth (float): Smoothing constant to avoid division by zero.
+      
+    Returns:
+      torch.Tensor: Scalar Tversky loss (averaged over classes and batch).
+    """
+    num_classes = logits.shape[1]
+    # One-hot encode the labels and reshape to [B, num_classes, H, W]
+    labels_one_hot = F.one_hot(labels, num_classes).permute(0, 3, 1, 2).float()
+    # Get probabilities using softmax
+    probs = torch.softmax(logits, dim=1)
+    
+    tversky_loss_value = 0.0
+    # Compute loss for each class
+    for c in range(num_classes):
+        prob_c = probs[:, c, :, :]
+        true_c = labels_one_hot[:, c, :, :]
+        # True positives, false positives, and false negatives
+        TP = (prob_c * true_c).sum(dim=(1, 2))
+        FP = (prob_c * (1 - true_c)).sum(dim=(1, 2))
+        FN = ((1 - prob_c) * true_c).sum(dim=(1, 2))
+        # Tversky index per sample
+        tversky_index = (TP + smooth) / (TP + alpha * FP + beta * FN + smooth)
+        # Loss is 1 - Tversky index, averaged over the batch
+        tversky_loss_value += (1 - tversky_index).mean()
+    tversky_loss_value /= num_classes
+    return tversky_loss_value
+
+def combined_loss(logits, labels, weight_ce=1.0, weight_tv=1.0, smooth=1e-6, alpha=0.7, beta=0.3):
+    """
+    Computes a combined loss that is a weighted sum of CrossEntropy loss and Tversky loss.
+    
+    Args:
+      logits (torch.Tensor): Raw model output of shape [B, num_classes, H, W].
+      labels (torch.Tensor): Ground truth labels of shape [B, H, W].
+      weight_ce (float): Weight for the CrossEntropy component.
+      weight_tv (float): Weight for the Tversky component.
+      smooth (float): Smoothing constant.
+      alpha (float): Parameter for Tversky loss for false positives.
+      beta (float): Parameter for Tversky loss for false negatives.
+    
+    Returns:
+      torch.Tensor: The combined loss.
+    """
+    # CrossEntropy Loss component (works directly with integer labels)
+    ce_loss = torch.nn.CrossEntropyLoss()(logits, labels)
+    # Tversky Loss component
+    tv_loss = tversky_loss(logits, labels, alpha=alpha, beta=beta, smooth=smooth)
+    # Combine both losses using the provided weights
+    return weight_ce * ce_loss + weight_tv * tv_loss
+
 #Metrics    
 def compute_iou(preds, labels, num_classes):
     preds = preds.cpu() if preds.is_cuda else preds
@@ -138,12 +197,13 @@ def compute_metrics(p):
     dice = compute_dice_coefficient(preds, labels, num_classes=NUM_CLASSES)
     iou = compute_iou(preds, labels, num_classes=NUM_CLASSES)
     accuracy = compute_pixel_accuracy(preds, labels)
-    
+    tv_loss = tversky_loss(logits, labels,alpha=0.7, beta=0.3, smooth=1e-6)
     return {
         "accuracy": accuracy,
         "dice": dice,
         "iou": iou,
         "bce": bce_loss.item(),
+        "tv": tv_loss
     }
 
 #class VisualizationCallback(transformers.TrainerCallback):
@@ -196,75 +256,89 @@ def compute_metrics(p):
 #                    gt_tensor = T.ToTensor()(gt_colored/255.0)
 #                    self.writer.add_image(f"Ground Truth Mask {i}", gt_tensor, global_step=state.global_step)
 
-def visualize_predictions(model, dataloader, device, num_images=3, alpha=0.6, contour_color='red'):
+def visualize_predictions_with_gt(model, dataloader, device, num_images=3, alpha=0.6):
     """
-    Visualizes predictions by blending the original image with the predicted mask.
-    Then, draws segmentation boundaries on the overlay.
-    
+    Visualizes predictions with a side-by-side comparison:
+      Left: Original image with the predicted mask overlaid.
+      Right: The corresponding ground truth mask.
+      
     Parameters:
       model: the segmentation model
-      dataloader: a DataLoader with test images
-      device: torch.device on which model/data is located
-      num_images: number of examples to display
-      alpha: blending factor for overlay (0 -> original, 1 -> mask)
-      contour_color: color used for drawing segmentation boundaries
+      dataloader: a DataLoader with test images and masks
+      device: torch.device where data/model reside
+      num_images: how many examples to display
+      alpha: blending factor for the predicted overlay
     """
     model.eval()
     batch = next(iter(dataloader))
-    inputs = {key: value.to(device) for key, value in batch.items()}
+    inputs = {k: v.to(device) for k, v in batch.items()}
     
     with torch.no_grad():
         outputs = model(**inputs)
-    logits = outputs.logits  # Shape: (B, num_classes, H_pred, W_pred)
-    preds = torch.argmax(logits, dim=1)  # Shape: (B, H_pred, W_pred)
+    logits = outputs.logits  # shape: (B, num_classes, H_pred, W_pred)
+    preds = torch.argmax(logits, dim=1)  # shape: (B, H_pred, W_pred)
     
-    # Define your class colors (here, background black; foreground white)
+    # Define colors (e.g., background black, foreground white)
     class_colors = np.array([[0, 0, 0], [255, 255, 255]])
     
     for i in range(min(num_images, preds.shape[0])):
-        # Get original image: convert to HWC and clip for display
+        # Prepare the original image in HWC format, clipped for display
         image = inputs['pixel_values'][i].cpu().numpy().transpose(1, 2, 0)
         image = np.clip(image, 0, 1)
         
-        # Predicted mask (initially smaller): convert to numpy
-        pred_mask = preds[i].cpu().numpy()  # Shape: (H_pred, W_pred)
-        # Colorize the mask according to class_colors
-        colored_mask = class_colors[pred_mask]  # Shape: (H_pred, W_pred, 3)
-        
-        # Upsample the colored mask to match the original image size
-        colored_mask_tensor = torch.tensor(colored_mask.transpose(2, 0, 1)).unsqueeze(0).float()
-        upsampled_mask_tensor = F.interpolate(colored_mask_tensor,
-                                              size=(image.shape[0], image.shape[1]),
+        # Process predicted mask: convert class indices to a colored mask
+        pred_mask = preds[i].cpu().numpy()
+        colored_pred = class_colors[pred_mask]  # shape: (H_pred, W_pred, 3)
+        # Upsample colored prediction mask to match original image dimensions
+        colored_pred_tensor = torch.tensor(colored_pred.transpose(2, 0, 1)).unsqueeze(0).float()
+        upsampled_pred_tensor = F.interpolate(colored_pred_tensor, 
+                                              size=(image.shape[0], image.shape[1]), 
                                               mode='nearest')
-        upsampled_mask = upsampled_mask_tensor.squeeze(0).permute(1, 2, 0).numpy()
+        upsampled_pred = upsampled_pred_tensor.squeeze(0).permute(1, 2, 0).numpy()
+        # Blend overlay: transparent mix of original image and upsampled prediction mask
+        overlay_pred = (1 - alpha) * image + alpha * (upsampled_pred / 255.0)
         
-        # Blend original image and colored mask
-        overlay = (1 - alpha) * image + alpha * (upsampled_mask / 255.0)
+        # Process ground truth mask: colorize and simply display it
+        gt_mask = batch['labels'][i].cpu().numpy()
+        colored_gt = class_colors[gt_mask]
         
-        # Plot the overlay
-        plt.figure(figsize=(8, 8))
-        plt.imshow(overlay)
+        # Create subplots: Left with overlay, right with ground truth mask
+        fig, ax = plt.subplots(1, 2, figsize=(16, 8))
+        ax[0].imshow(overlay_pred)
+        ax[0].set_title("Predicted Overlay on Image")
+        ax[0].axis('off')
         
-        # Draw boundaries: find contours on the predicted mask
-        # Note: Since pred_mask is smaller, we use scaling factors
-        contours = find_contours(pred_mask, level=0.5)
-        scale_x = image.shape[1] / pred_mask.shape[1]
-        scale_y = image.shape[0] / pred_mask.shape[0]
-        for contour in contours:
-            plt.plot(contour[:, 1] * scale_x, contour[:, 0] * scale_y, linewidth=2, color=contour_color)
+        ax[1].imshow(colored_gt)
+        ax[1].set_title("Ground Truth Mask")
+        ax[1].axis('off')
         
-        plt.axis('off')
         plt.show()
 
+
+class CustomTrainer(Trainer):
+     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        labels = inputs.pop("labels")  # shape: [B, 512, 512]
+        outputs = model(**inputs)
+        logits = outputs.logits         # shape: [B, 2, 128, 128]
+        
+        # If spatial sizes don't match, downsample labels using nearest neighbor interpolation
+        if labels.shape[-2:] != logits.shape[-2:]:
+            # Add channel dimension: [B, 1, H, W]
+            labels = labels.unsqueeze(1).float()
+            labels = F.interpolate(labels, size=logits.shape[-2:], mode="nearest")
+            labels = labels.squeeze(1).long()
+        
+        loss = combined_loss(logits, labels)
+        return (loss, outputs) if return_outputs else loss
 #Loading
-feature_extractor = SegformerImageProcessor.from_pretrained("nvidia/segformer-b0-finetuned-ade-512-512")
+feature_extractor = SegformerImageProcessor.from_pretrained("nvidia/segformer-b2-finetuned-ade-512-512")
 train_dataset = SegmentationDataset(IMAGE_DIR, MASK_DIR, feature_extractor)
 test_dataset = SegmentationDataset(TEST_IMAGE_DIR, TEST_MASK_DIR, feature_extractor)
 test_dataloader = DataLoader(test_dataset, batch_size=4)
 
 #Loading model
 model = SegformerForSemanticSegmentation.from_pretrained(
-    "nvidia/segformer-b0-finetuned-ade-512-512",
+    "nvidia/segformer-b2-finetuned-ade-512-512",
     num_labels=NUM_CLASSES,
     ignore_mismatched_sizes=True
 )
@@ -274,16 +348,19 @@ model.to(DEVICE)
 training_args = TrainingArguments(
     output_dir="./segformer-checkpoints",
     per_device_train_batch_size=4,
-    num_train_epochs=10, 
+    num_train_epochs=1, 
     logging_dir="./logs",
     save_total_limit=2,
     save_steps=200,
     eval_strategy="steps",
     logging_steps=10,
-    eval_steps=100
+    eval_steps=100,   # Lower learning rate for smoother convergence
+    weight_decay=0.01,     # Add weight decay for regularization
+    adam_beta1=0.85,       # Adjust beta1 to reduce momentum slightly
+    adam_beta2=0.999,
 )
 
-trainer = Trainer(
+trainer = CustomTrainer(
     model=model,
     args=training_args,
     train_dataset=train_dataset,
@@ -302,19 +379,18 @@ trainer.train()
 
 trainer.evaluate()
 
-def test_simgle_image(model, processor, image_path):
-    image = Image.open(image_path).convert("RGB")
-    encoding = processor(images=image, return_tensor="pt").to(DEVICE)
+#def test_simgle_image(model, processor, image_path):
+#    image = Image.open(image_path).convert("RGB")
+#    encoding = processor(images=image, return_tensor="pt").to(DEVICE)
     
-    model.eval()
-    with torch.no_grad():
-        outputs = model(**encoding)
-        logits = outputs.logits
-        pred = torch.argmax(logits, dim=1).squeeze().cpu().numpy()
+#    model.eval()
+#    with torch.no_grad():
+#        outputs = model(**encoding)
+#        logits = outputs.logits
+#        pred = torch.argmax(logits, dim=1).squeeze().cpu().numpy()
 
-    plt.imshow(pred, cmap='gray')
-    plt.title("Predicted Mask")
-    plt.show()
+#    plt.imshow(pred, cmap='gray')
+#    plt.title("Predicted Mask")
+#    plt.show()
     
-    visualize_predictions(model, test_dataloader, DEVICE, num_images=3)
-# test_single_image(model, feature_extractor, "C:/Users/Public/segformer/dataset/test/images/image1.jpg")
+visualize_predictions(model, test_dataloader, DEVICE, num_images=3)
