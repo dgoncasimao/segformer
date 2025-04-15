@@ -6,12 +6,13 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import pytorch_lightning as pl
 from transformers import SegformerForSemanticSegmentation, SegformerImageProcessor
+import matplotlib.pyplot as plt
 
 # === Configurations ===
-IMAGE_DIR = 'C:/Users/Public/segformer/dataset/train/images'
-MASK_DIR = 'C:/Users/Public/segformer/dataset/train/masks'
-TEST_IMAGE_DIR = 'C:/Users/Public/segformer/dataset/test/images'
-TEST_MASK_DIR = 'C:/Users/Public/segformer/dataset/test/masks'
+IMAGE_DIR = 'C:/Users/DSBG-Public/segformer/dataset/train/images'
+MASK_DIR = 'C:/Users/DSBG-Public/segformer/dataset/train/masks'
+TEST_IMAGE_DIR = 'C:/Users/DSBG-Public/segformer/dataset/test/images'
+TEST_MASK_DIR = 'C:/Users/DSBG-Public/segformer/dataset/test/masks'
 NUM_CLASSES = 2
 
 # === Dataset ===
@@ -71,8 +72,7 @@ def compute_pixel_accuracy(preds, labels):
     preds = preds.flatten()
     labels = labels.flatten()
     correct_pixels = (preds == labels).sum().item()
-    total_pixels = labels.numel()
-    return correct_pixels / total_pixels
+    return correct_pixels / labels.numel()
 
 def compute_dice_coefficient(preds, labels, num_classes=2):
     dice_scores = []
@@ -99,7 +99,6 @@ class LitSegformer(pl.LightningModule):
     def __init__(self, num_labels=NUM_CLASSES, learning_rate=5e-5, weight_decay=0.01):
         super().__init__()
         self.save_hyperparameters()
-        # Using the B0 checkpoint as a better baseline
         self.model = SegformerForSemanticSegmentation.from_pretrained(
             "nvidia/segformer-b0-finetuned-ade-512-512",
             num_labels=num_labels,
@@ -114,6 +113,11 @@ class LitSegformer(pl.LightningModule):
         pixel_values = batch["pixel_values"]
         outputs = self.model(pixel_values=pixel_values)
         logits = outputs.logits
+        # Resize labels to match logits spatial dimensions if necessary.
+        if labels.shape[-2:] != logits.shape[-2:]:
+            labels = labels.unsqueeze(1).float()
+            labels = F.interpolate(labels, size=logits.shape[-2:], mode="nearest")
+            labels = labels.squeeze(1).long()
         loss = combined_loss(logits, labels)
         self.log("train_loss", loss, prog_bar=True)
         return loss
@@ -123,6 +127,10 @@ class LitSegformer(pl.LightningModule):
         pixel_values = batch["pixel_values"]
         outputs = self.model(pixel_values=pixel_values)
         logits = outputs.logits
+        if labels.shape[-2:] != logits.shape[-2:]:
+            labels = labels.unsqueeze(1).float()
+            labels = F.interpolate(labels, size=logits.shape[-2:], mode="nearest")
+            labels = labels.squeeze(1).long()
         loss = combined_loss(logits, labels)
         preds = torch.argmax(logits, dim=1)
         acc = compute_pixel_accuracy(preds, labels)
@@ -142,23 +150,73 @@ class LitSegformer(pl.LightningModule):
         )
         return optimizer
 
-# === Data Setup ===
+# === Visualization Callback ===
+class ImagePredictionCallback(pl.Callback):
+    def __init__(self, val_dataloader, num_images=3):
+        super().__init__()
+        self.val_dataloader = val_dataloader
+        self.num_images = num_images
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        # Get one batch from the validation dataloader
+        batch = next(iter(self.val_dataloader))
+        pixel_values = batch["pixel_values"]
+        labels = batch["labels"]
+        device = pl_module.device
+        pl_module.model.eval()
+        with torch.no_grad():
+            outputs = pl_module.model(pixel_values=pixel_values.to(device))
+        logits = outputs.logits
+        preds = torch.argmax(logits, dim=1)
+        
+        # Upsample predictions to match input image size if needed
+        upsampled_preds = []
+        for i in range(self.num_images):
+            pred = preds[i].unsqueeze(0).unsqueeze(0).float()  # [1,1,H',W']
+            up_pred = F.interpolate(pred, size=pixel_values[i].shape[1:], mode='nearest')
+            upsampled_preds.append(up_pred.squeeze().cpu().numpy().astype(np.uint8))
+        
+        # Convert images from tensor to numpy arrays for plotting
+        images = [pixel_values[i].permute(1, 2, 0).cpu().numpy() for i in range(self.num_images)]
+        gt_masks = [labels[i].cpu().numpy() for i in range(self.num_images)]
+        
+        # Plot input image, predicted mask, and ground truth side by side
+        fig, axs = plt.subplots(self.num_images, 3, figsize=(12, 4 * self.num_images))
+        if self.num_images == 1:
+            axs = np.expand_dims(axs, axis=0)
+        for i in range(self.num_images):
+            axs[i, 0].imshow(images[i])
+            axs[i, 0].set_title("Input Image")
+            axs[i, 0].axis('off')
+            
+            axs[i, 1].imshow(upsampled_preds[i], cmap='gray')
+            axs[i, 1].set_title("Predicted Mask")
+            axs[i, 1].axis('off')
+            
+            axs[i, 2].imshow(gt_masks[i], cmap='gray')
+            axs[i, 2].set_title("Ground Truth")
+            axs[i, 2].axis('off')
+        plt.tight_layout()
+        plt.show()
+
+# === Data Setup & Training ===
 if __name__ == "__main__":
-    # Use the B0-compatible processor
     feature_extractor = SegformerImageProcessor.from_pretrained("nvidia/segformer-b0-finetuned-ade-512-512")
     train_dataset = SegmentationDataset(IMAGE_DIR, MASK_DIR, feature_extractor)
     val_dataset = SegmentationDataset(TEST_IMAGE_DIR, TEST_MASK_DIR, feature_extractor)
     
-    train_dataloader = DataLoader(train_dataset, batch_size=4, shuffle=True)
-    val_dataloader = DataLoader(val_dataset, batch_size=4)
+    train_dataloader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=3, prefetch_factor=8)
+    val_dataloader = DataLoader(val_dataset, batch_size=4,  num_workers=3, prefetch_factor=8)
     
-    # Initialize the Lightning module and trainer
     model = LitSegformer(num_labels=NUM_CLASSES)
+    
+    # Add the visualization callback to display predicted masks after validation
+    image_callback = ImagePredictionCallback(val_dataloader, num_images=3)
+    
     trainer = pl.Trainer(
-        max_epochs=1,
-        gpus=1 if torch.cuda.is_available() else 0,
-        log_every_n_steps=10
+        max_epochs=10,
+        log_every_n_steps=10,
+        callbacks=[image_callback]
     )
     
-    # Start training
     trainer.fit(model, train_dataloader, val_dataloader)
