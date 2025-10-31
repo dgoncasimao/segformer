@@ -19,3 +19,6 @@ dependencies:
     - matplotlib
     - opencv-python
     - pillow
+    - ipykernel
+    - pynrrd
+    - albumentations
