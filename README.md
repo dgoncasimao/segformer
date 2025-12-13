@@ -56,7 +56,7 @@ The core of the project is the Jupyter Notebook `script.ipynb`.
     ```
 
 3.  **Run the Pipeline:**
-    Open `inference_pipeline.ipynb` and follow the interactive steps:
+    Open `script.ipynb` and follow the interactive steps:
     * **Step 1:** Load dependencies.
     * **Step 2 (Hyperparameters):** Adjust `threshold` (default 0.5) and `crop_margin`. *Note: Correct tuning is essential to avoid noise artifacts.*
     * **Step 3 (Input):** Provide the path to your input volume (e.g., `data/volume.nrrd`).
