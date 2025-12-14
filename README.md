@@ -3,7 +3,6 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-1.13%2B-ee4c2c)](https://pytorch.org/)
 [![Hugging Face](https://img.shields.io/badge/Transformers-Hugging%20Face-yellow)](https://huggingface.co/)
-[![3D Slicer](https://img.shields.io/badge/Integration-3D%20Slicer-lightgrey)](https://www.slicer.org/)
 
 ## 📋 Overview
 
