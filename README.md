@@ -27,22 +27,7 @@ The pipeline automates the segmentation of the *M. vastus lateralis* in volumetr
 * Anaconda or Miniconda
 
 ### Environment Setup
-Create a new environment and install the required dependencies (PyTorch, Transformers, PyNRRD, Albumentations, etc.):
-
-```bash
-# 1. Create environment
-conda create -n segformer python=3.10
-conda activate segformer
-
-# 2. Install PyTorch (Check [https://pytorch.org/](https://pytorch.org/) for your specific CUDA version)
-conda install pytorch torchvision torchaudio pytorch-cuda=11.8 -c pytorch -c nvidia
-
-# 3. Install pipeline dependencies
-pip install transformers numpy pynrrd tifffile ipywidgets albumentations pytorch-lightning pillow
-
-## 🚀 Usage
-
-The core of the project is the Jupyter Notebook `script.ipynb`.
+To ensure all dependencies are compatible, please use the provided `environment.yml` file to create the Conda environment.
 
 1.  **Clone the repository:**
     ```bash
@@ -50,18 +35,45 @@ The core of the project is the Jupyter Notebook `script.ipynb`.
     cd segformer
     ```
 
-2.  **Start Jupyter:**
+2.  **Create and activate the environment:**
+    ```bash
+    conda env create -f environment.yml
+    conda activate segformer
+    ```
+
+---
+
+## 🚀 Usage
+
+The core of the project is the Jupyter Notebook `script.ipynb`.
+
+### 1. Configuration (Crucial Step)
+Before running the script, you must configure the path to the model weights.
+
+1.  Locate the directory `segformer_export_hf` inside this repository.
+2.  Get the **absolute path** of this directory on your machine.
+    * *Example (Windows):* `C:\Users\Luca\Projects\segformer\segformer_export_hf`
+    * *Example (Linux/Mac):* `/home/luca/projects/segformer/segformer_export_hf`
+3.  Open `script.ipynb`.
+4.  Find the **Hyperparameters** cell (usually near the top) and update the `hf_model_dir` variable:
+    ```python
+    # Example inside script.ipynb
+    hf_model_dir = "C:/Users/Luca/Projects/segformer/segformer_export_hf" 
+    ```
+
+### 2. Run the Pipeline
+1.  **Start Jupyter:**
     ```bash
     jupyter notebook
     ```
-
-3.  **Run the Pipeline:**
-    Open `script.ipynb` and follow the interactive steps:
+2.  **Open `script.ipynb`** and follow the interactive steps:
     * **Step 1:** Load dependencies.
-    * **Step 2 (Hyperparameters):** Adjust `threshold` (default 0.5) and `crop_margin`. *Note: Correct tuning is essential to avoid noise artifacts.*
+    * **Step 2:** Ensure the `hf_model_dir` is set correctly as described above.
     * **Step 3 (Input):** Provide the path to your input volume (e.g., `data/volume.nrrd`).
     * **Step 4 (Inference):** The script executes slice-by-slice prediction using the SegFormer weights.
     * **Step 5 (Reconstruction):** The output mask is saved as `volume_segmentation.nrrd` in the same folder.
+
+---
 
 ## ⚠️ Known Limitations
 
